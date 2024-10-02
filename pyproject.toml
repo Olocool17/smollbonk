@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "smollbonk"
+version = "0.1.0"
+description = "Preprocessor for the Smollbonk macro language."
+authors = ["Olocool17 <22843298+Olocool17@users.noreply.github.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+click = "^8.1.7"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.6.8"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
