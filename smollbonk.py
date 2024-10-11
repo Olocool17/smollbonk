@@ -4,9 +4,10 @@ import re
 from pathlib import Path
 import string
 import itertools
-from typing import Generator, Callable
+from typing import Generator
 from io import BufferedReader
 from copy import deepcopy
+from functools import cache
 import time
 
 source_extension = ".sbonk"
@@ -111,7 +112,7 @@ class Parser:
     def parse_instruction(line: str) -> Instruction:
         parts = [e.strip() for e in line.strip().split()]
         ins = parts[0]
-        args_str = " ".join(parts[1:])
+        args_str = " ".join(parts[1:]) + " "
         if ins not in instructions:
             raise CompileError(f"Instruction '{ins}' is not a valid instruction.")
         ins_type, arg_types = instructions[ins]
@@ -122,13 +123,18 @@ class Parser:
                 raise CompileError(
                     f"Instruction '{ins.ins}' requires {len(arg_types)} arguments but fewer were given."
                 )
-            match = re.match(arg_type.re_pattern, args_str)
-            if match is None:
+            for arg_subtype in (arg_type, *arg_type.get_all_subclasses()):
+                if not hasattr(arg_subtype, "re_pattern"):
+                    continue
+                match = re.match(arg_subtype.re_pattern, args_str)
+                if match is not None:
+                    ins.args.append(arg_subtype(ins, match.group(0)[:-1]))
+                    args_str = args_str[match.end():].lstrip()
+                    break
+            if match is None:                
                 raise CompileError(
                     f"'{args_str} could not be parsed to a valid {arg_type.__name__}."
                 )
-            ins.args.append(arg_type(ins, match.group(0)))
-            args_str = args_str[match.end() :].lstrip()
         if len(args_str.strip()) > 0:
             raise CompileError(
                 f"Instruction '{ins.ins}' requires {len(arg_types)} arguments but more were given."
@@ -243,6 +249,10 @@ class Template(Block):
     def register_targets(self):
         pass
 
+    def update_count(self):
+        for instantiation in self.instantiations.values():
+            if not isinstance(instantiation, Procedure):
+                instantiation.recurse("update_count")
 
     def add_instantiation(self, literal_args: tuple): 
         instantiation = self.cls(self.name)
@@ -363,6 +373,9 @@ class Procedure(TemplateableBlock):
         inlined.recurse("register_targets")
         self.proc_counter += 1
         return inlined.transplant_children(after)
+    
+    def update_count(self):
+        pass
 
     def emit(self) -> str:
         return ""
@@ -395,10 +408,12 @@ class TemplateSpecialisationBlock(Block):
 
 
 class Instruction(Node):
+    count : int = 0
+
     def __init__(self, ins: str):
         super().__init__()
         self.ins: str = ins
-        self.args: list[Argument] = []
+        self.args: list[AbstractArgument] = []
 
     def stamp(self, template_translation: dict[str, str]):
         for arg in self.args:
@@ -406,13 +421,22 @@ class Instruction(Node):
 
     def recurse(self, func: str, *args, **kwargs):
         for arg in self.args:
-            try:
+            if hasattr(arg, func):
                 getattr(arg, func)(*args, **kwargs)
-            except AttributeError:
-                continue
+
+    def update_count(self):
+        self.count = Instruction.count
+        if self.ins in ("turnl", "turnr", "fsens", "lsens", "rsens", "nsens"):
+            increment = 3
+        elif self.ins == "fwd":
+            increment = 2
+        else:
+            increment = 1
+
+        Instruction.count += increment
 
     def __str__(self):
-        return f"{self.__class__.__name__}({self.ins})"
+        return f"{self.__class__.__name__}({self.ins}) {" ".join(str(arg) for arg in self.args)}"
 
     def emit(self) -> str:
         return self.ins + " " + " ".join(arg.emit() for arg in self.args)
@@ -423,13 +447,8 @@ class JumpInstruction(Instruction):
         arg = self.args[0]
         if isinstance(arg, LabelArgument):
             arg.register_targets(Label)
-
-    def emit(self) -> str:
-        arg = self.args[0]
-        if isinstance(arg, LabelArgument):
-            return self.ins + " " + arg.target.mangled_name
-        return self.ins + " " + arg.arg
-
+        elif isinstance(arg, AddressOfArgument):
+            arg.register_targets()
 
 class CallInstruction(JumpInstruction):
     def register_targets(self):
@@ -451,9 +470,7 @@ class CallInstruction(JumpInstruction):
         raise CompileError()
 
 
-class Argument:
-    re_pattern: str = r"\$?(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+"
-
+class AbstractArgument:
     def __init__(self, ins: Instruction, arg: str):
         self.ins = ins
         self.arg = arg
@@ -462,23 +479,43 @@ class Argument:
         for k, v in template_translation.items():
             self.arg = re.sub(f"\\[ *{k} *\\]", v, self.arg)
 
+    def __str__(self):
+        return f"{self.__class__.__name__}({self.arg})"
+    
+    @classmethod
+    @cache
+    def get_all_subclasses(cls) -> list[type[AbstractArgument]]:
+        all_subclasses = [cls]
+        for subclass in cls.__subclasses__():
+            all_subclasses.extend(subclass.get_all_subclasses())
+        return all_subclasses
+
     def emit(self) -> str:
         return self.arg
+    
+class Argument(AbstractArgument):
+    pass
 
+class RegisterArgument(Argument):
+    re_pattern: str = r"\$(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+ "
 
 class ConstantArgument(Argument):
-    re_pattern: str = r"(?:0b|0x|)(?:[a-fA-F0-9]|(?:\[[a-zA-Z0-9_ ]+\]))+"
+    re_pattern: str = r"(?:0b|0x|)(?:[a-fA-F0-9]|(?:\[[a-zA-Z0-9_ ]+\]))+ "
+
+class LogArgument(AbstractArgument):
+    re_pattern: str = r"(?:[a-zA-Z0-9_ \$]|(?:\[[a-zA-Z0-9_ ]+\]))+ "
 
 
-class LabelArgument(Argument):
-    re_pattern: str = r"(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+(?:<[a-zA-Z0-9_ ,]+>)?"
+class LabelArgument(AbstractArgument):
+    re_pattern: str = r"(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+(?:<[a-zA-Z0-9_ ,]+>)? "
+    stamp_pattern: str = r"([a-zA-Z0-9_]+)(?:<([a-zA-Z0-9_ ,]+)>)?"
     target = None
     def register_targets(self, target_cls : type[TemplateableBlock]):
         if len(self.template_args) == 0:
-            if self.arg != "return":
-                self.target = target_cls.registry[self.arg]
+            if self.target_name != "return" and self.target_name in target_cls.registry:
+                self.target = target_cls.registry[self.target_name]
             if self.target is None:
-                raise CompileError(f"No viable block target found for label argument '{self.arg}'.")
+                raise CompileError(f"No viable block target found for '{self.target_name}'.")
             return
         if self.target_name not in Template.registry:
             raise CompileError(f"No viable template found with name '{self.target_name}' for label argument '{self.arg}'.")
@@ -493,27 +530,49 @@ class LabelArgument(Argument):
 
 
     def stamp(self, template_translation: dict[str, str]):
-        Argument.stamp(self, template_translation)
-        match = re.search(r"<([a-zA-Z0-9_ ,]+)>", self.arg)
-        if match is None:
+        AbstractArgument.stamp(self, template_translation)
+        match = re.search(self.stamp_pattern, self.arg)
+        if match.group(2) is None:
             self.template_args = tuple()
+            self.target_name = match.group(1)
             return
-        template_args = tuple(e.strip() for e in  match.group(1).split(","))
+        template_args = tuple(e.strip() for e in  match.group(2).split(","))
         template_translation = Template.remove_internals(template_translation)
         self.template_args = tuple(template_translation[t] if t in template_translation else t for t in template_args)
-        self.target_name = self.arg[:match.start()]
+        if match.group(1) is None:
+            raise CompileError(f"Expanded argument {self.arg} does not name a target.")
+        self.target_name = match.group(1)
 
     def replace_return(self, trailing_label : Label):
         if self.arg != "return":
             return
         self.target = trailing_label
 
+    def emit(self) -> str:
+        return self.target.mangled_name
 
-class RegisterArgument(Argument):
-    re_pattern: str = r"\$(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+"
+class AddressOfArgument(ConstantArgument):
+    re_pattern: str = r"addressof\((?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+(?:<[a-zA-Z0-9_ ,]+>)?\) "
+    stamp_pattern: str = r"addressof\(([a-zA-Z0-9_]+)(?:<([a-zA-Z0-9_ ,]+)>)?\)"
+    target = None
+
+    def register_targets(self):
+        LabelArgument.register_targets(self, Label)
+
+    def stamp(self, template_translation: dict[str, str]):
+        LabelArgument.stamp(self, template_translation)
+
+    def emit(self) -> str:
+        target_ins = self.target
+        while isinstance(target_ins, Block):
+            if len(target_ins.children) == 0:
+                raise CompileError("Targeted label for addressof() does not contain any instruction.")
+            target_ins = target_ins.children[0]
+            
+        return str(target_ins.count)
 
 
-instructions: dict[str, tuple[type[Instruction], tuple[type[Argument], ...]]] = {
+instructions: dict[str, tuple[type[Instruction], tuple[type[AbstractArgument], ...]]] = {
     "add": (Instruction, (Argument, Argument, RegisterArgument)),
     "sub": (Instruction, (Argument, Argument, RegisterArgument)),
     "mul": (Instruction, (Argument, Argument, RegisterArgument)),
@@ -544,7 +603,7 @@ instructions: dict[str, tuple[type[Instruction], tuple[type[Argument], ...]]] = 
     "wait": (Instruction, ()),
     "stop": (Instruction, ()),
     "syscall": (Instruction, ()),
-    "log": (Instruction, (Argument,)),
+    "log": (Instruction, (LogArgument,)),
     "fwd": (Instruction, ()),
     "turnl": (Instruction, (Argument,)),
     "turnr": (Instruction, (Argument,)),
@@ -573,6 +632,7 @@ def compile(source: BufferedReader) -> str:
     root.recurse("stamp", {})
     root.recurse("register_labels")
     root.recurse("register_targets")
+    root.recurse("update_count")
     end_time = time.time_ns()
     print(f" took {(end_time - begin_time) / 1000000} ms.")
     begin_time = end_time
