@@ -1,3 +1,4 @@
+from __future__ import annotations
 import click
 import re
 from pathlib import Path
@@ -5,14 +6,155 @@ import string
 import itertools
 from typing import Generator, Callable
 from io import BufferedReader
+from copy import deepcopy
+import time
 
 source_extension = ".sbonk"
 bonk_extension = ".bonk"
 
 
+class Parser:
+    def __init__(self, source: BufferedReader):
+        self.source = source
+        self.ident = 0
+        self.line_count = 0
+        self.node = Block()
+
+    def add(self, new_node) -> Node:
+        new_node.parent = self.node
+        self.node.children.append(new_node)
+        return new_node
+
+    def add_and_indent(self, new_node) -> None:
+        new_node = self.add(new_node)
+        self.node = new_node
+        self.ident += 1
+
+    def dedent(self) -> None:
+        self.node = self.node.parent
+        self.ident -= 1
+
+    def parse(self) -> Block:
+        try:
+            return self._parse()
+        except Exception as e:
+            e.add_note(f"... while parsing '{self.source.name}:{self.line_count}'")
+            raise
+
+    def _parse(
+        self,
+    ) -> Block:
+        while True:
+            if (
+                self.source.peek(self.ident * 4)[: self.ident * 4].decode().count(" ")
+                < self.ident * 4
+            ):
+                self.dedent()
+                continue
+
+            raw_line = self.source.readline().decode()
+            if len(raw_line) == 0:
+                return self.node
+            self.line_count += 1
+
+            line = raw_line.strip()
+            if len(line) == 0:
+                continue
+
+            match = re.match(
+                r"repeat +([0-9]+) *:(.*)",
+                line,
+            )
+            if match is not None:
+                self.add_and_indent(RepeatBlock(int(match.group(1))))
+                if match.group(2) is not None and len(match.group(2).strip()) > 0:
+                    self.add(self.parse_instruction(match.group(2)))
+                continue
+
+            match = re.match(
+                r"(?:template<([a-zA-Z0-9_ ,]+)> *)?(label|proc) +([a-zA-Z0-9_]+) *:(.*)",
+                line,
+            )
+            if match is not None:
+                if match.group(2) == "label":
+                    cls = Label
+                elif match.group(2) == "proc":
+                    cls = Procedure
+                if match.group(1) is not None:
+                    template_args: tuple[str] = tuple(
+                        e.strip() for e in match.group(1).split(",")
+                    )
+                    self.add_and_indent(Template(match.group(3), cls, template_args))
+                else:
+                    self.add_and_indent(cls(match.group(3)))
+                if match.group(4) is not None and len(match.group(4).strip()) > 0:
+                    self.add(self.parse_instruction(match.group(4)))
+                continue
+
+            match = re.match(r"template<([a-zA-Z0-9_\* ,]+)> *:(.*)", line)
+            if match is not None and match.group(1) is not None:
+                literal_args: tuple[str] = tuple(
+                    e.strip() for e in match.group(1).split(",")
+                )
+                self.add_and_indent(
+                    TemplateSpecialisationBlock(literal_args=literal_args)
+                )
+                if match.group(2) is not None and len(match.group(2).strip()) > 0:
+                    self.add(self.parse_instruction(match.group(2)))
+                continue
+
+            if line[:2] == "--":
+                continue
+            self.add(self.parse_instruction(line))
+
+    @staticmethod
+    def parse_instruction(line: str) -> Instruction:
+        parts = [e.strip() for e in line.strip().split()]
+        ins = parts[0]
+        args_str = " ".join(parts[1:])
+        if ins not in instructions:
+            raise CompileError(f"Instruction '{ins}' is not a valid instruction.")
+        ins_type, arg_types = instructions[ins]
+
+        ins = ins_type(ins)
+        for arg_type in arg_types:
+            if len(args_str.strip()) == 0:
+                raise CompileError(
+                    f"Instruction '{ins.ins}' requires {len(arg_types)} arguments but fewer were given."
+                )
+            match = re.match(arg_type.re_pattern, args_str)
+            if match is None:
+                raise CompileError(
+                    f"'{args_str} could not be parsed to a valid {arg_type.__name__}."
+                )
+            ins.args.append(arg_type(ins, match.group(0)))
+            args_str = args_str[match.end() :].lstrip()
+        if len(args_str.strip()) > 0:
+            raise CompileError(
+                f"Instruction '{ins.ins}' requires {len(arg_types)} arguments but more were given."
+            )
+        return ins
+
+
 class Node:
     def __init__(self):
         self.parent: Block | None = None
+
+    def cut(self):
+        self.parent.children.remove(self)
+        self.parent = None
+
+    def insert_after(self, after : Node):
+        after.parent.children.insert(after.parent.children.index(after) + 1, self)
+        self.parent = after.parent
+
+    def deepcopy_tree(self):
+        parent = self.parent 
+        self.parent = None
+        copy = deepcopy(self)
+        self.parent = parent
+        return copy
+        
 
     def __str__(self):
         return self.__class__.__name__
@@ -23,131 +165,108 @@ class Block(Node):
         super().__init__()
         self.children: list[Node] = []
 
-    def add(self, cls, *args, **kwargs) -> "Node":
-        new_node = cls(*args, **kwargs)
-        new_node.parent = self
-        self.children.append(new_node)
-        return new_node
-
-    def parse(self, source: BufferedReader, ident: int = 0, trailing_line: str = None):
-        while True:
-            if trailing_line is not None:
-                line = trailing_line.strip()
-                trailing_line = None
-            else:
-                if source.peek(ident * 4)[: ident * 4].decode().count(" ") < ident * 4:
-                    return
-                raw_line = source.readline().decode()
-                if len(raw_line) == 0:
-                    return
-                line = raw_line.strip()
-
-            if len(line) == 0:
-                continue
-
-            match = re.match(
-                r"repeat +([0-9]+) *:(.*)",
-                line,
-            )
-            if match is not None:
-                self.add(RepeatBlock, int(match.group(1))).parse(
-                    source, ident=ident + 1, trailing_line=match.group(2)
-                )
-                continue
-
-            match = re.match(
-                r"(?:template<([a-zA-Z0-9_ ,]+)> *)?(label|proc) +([a-zA-Z0-9_]+) *:(.*)",
-                line,
-            )
-            if match is not None:
-                template_args = tuple()
-                if match.group(1) is not None:
-                    template_args: tuple[str] = tuple(
-                        e.strip() for e in match.group(1).split(",")
-                    )
-                if match.group(2) == "label":
-                    cls = Label
-                elif match.group(2) == "proc":
-                    cls = Procedure
-                self.add(cls, match.group(3), template_args=template_args).parse(
-                    source, ident=ident + 1, trailing_line=match.group(4)
-                )
-                continue
-
-            match = re.match(r"template<([a-zA-Z0-9_\* ,]+)> *:(.*)", line)
-       
-            if match is not None:
-                template_args = tuple()
-                if match.group(1) is not None:
-                    template_args: tuple[str] = tuple(
-                        e.strip() for e in match.group(1).split(",")
-                    )
-                self.add(
-                    TemplateSpecialisationBlock, template_args=template_args
-                ).parse(source, ident=ident + 1, trailing_line=match.group(2))
-                continue
-
-            ins = line.split()[0]
-            args = " ".join(line.split()[1:])
-            if ins in ("jmp", "jtrue", "jfalse"):
-                self.add(JumpInstruction, ins, args)
-                continue
-            if ins in ("call", "calltrue", "callfalse"):
-                self.add(CallInstruction, ins, args)
-                continue
-            if ins in (
-                "add",
-                "sub",
-                "mul",
-                "div",
-                "mod",
-                "rand",
-                "and",
-                "or",
-                "xor",
-                "not",
-                "lshift",
-                "rshift",
-                "mov",
-                "read",
-                "write",
-                "cmp",
-                "gte",
-                "lte",
-                "gt",
-                "lt",
-                "jumpir",
-                "wait",
-                "stop",
-                "syscall",
-                "log",
-                "fwd",
-                "turnl",
-                "turnr",
-                "fsens",
-                "lsens",
-                "rsens",
-                "nsens",
-            ):
-                self.add(Instruction, ins, args)
-                continue
-            print(f"Line '{line}' could not be parsed.")
-
-    def recurse(self, func: Callable[[Node], None], *args, **kwargs):
+    def transplant_children(self, after : Node):
+        i = after.parent.children.index(after)
         for c in self.children:
-            try:
-                getattr(c, func.__name__)(*args, **kwargs)
-            except AttributeError:
-                if isinstance(c, Block):
-                    c.recurse(func, *args, **kwargs)
+            i += 1
+            after.parent.children.insert(i, c)
+            c.parent = after.parent
+        transplanted_children = self.children
+        self.children = []
+        return transplanted_children
 
-    def emit_children(self, indent, **kwargs):
+    def copy_children(self, after : Node) -> list[Node]:
+        i = after.parent.children.index(after)
+        copies_list = []
+        for c in self.children:
+            i += 1
+            c_copy = c.deepcopy_tree()
+            copies_list.append(c_copy)
+            after.parent.children.insert(i, c_copy)
+            c_copy.parent = after.parent
+        return copies_list
+    
+    def copy_children_on(self, on : Block):
+        for c in self.children:
+            c_copy = c.deepcopy_tree()
+            c_copy.parent = on
+            on.children.append(c_copy)
+
+    def emit_children(self, indent):
         s = ""
         indent_string = "\n"
         for _ in range(indent):
             indent_string += "    "
         for n in self.children:
-            emission = n.emit(**kwargs)
+            emission = n.emit()
+            if len(emission.strip()) == 0:
+                continue
+            s += indent_string
+            s += indent_string.join(emission.split("\n"))
+        return s + "\n"
+    
+    def recurse(self, func: str, *args, **kwargs):
+        for c in [c for c in self.children]:
+            if hasattr(c, func):
+                getattr(c, func)(*args, **kwargs)
+            else:
+                c.recurse(func, *args, **kwargs)
+
+
+    def __str__(self):
+        s = f"{self.__class__.__name__}"
+        for n in self.children:
+            s += "\n    "
+            s += "\n    ".join(str(n).split("\n"))
+        return s + "\n"
+
+
+class Template(Block):
+    registry: dict[str, Template] = {}
+
+    def __init__(self, name: str, cls: type[Block], template_args: tuple):
+        super().__init__()
+        self.name = name
+        self.cls = cls
+        self.template_args = template_args
+        self.instantiations: dict[tuple, TemplateableBlock] = {}
+
+    def __getitem__(self, literal_args: tuple) -> TemplateableBlock:
+        return self.instantiations[literal_args]
+    
+    def stamp(self, template_translation: dict[str, str]):
+        pass
+    
+    def register_labels(self):
+        self.registry[self.name] = self
+
+    def register_targets(self):
+        pass
+
+
+    def add_instantiation(self, literal_args: tuple): 
+        instantiation = self.cls(self.name)
+        for c in self.children:
+            c.parent = None
+        instantiation.children = deepcopy(self.children)
+        for c in self.children:
+            c.parent = self
+        for c in instantiation.children:
+            c.parent = instantiation
+        instantiation.parent = self.parent
+        template_translation = {k: v for k, v in zip(self.template_args, literal_args)}
+        instantiation.stamp_root(template_translation)
+        self.instantiations[literal_args] = instantiation
+
+    @staticmethod
+    def remove_internals(template_translation: dict[str, str]) -> dict[str, str]:
+        return {k:v for k,v in template_translation.items() if not k.startswith("__")}
+    
+    def emit(self) -> str:
+        s = ""
+        indent_string = "\n"
+        for instantiation in self.instantiations.values():
+            emission = instantiation.emit()
             if len(emission.strip()) == 0:
                 continue
             s += indent_string
@@ -155,7 +274,7 @@ class Block(Node):
         return s + "\n"
 
     def __str__(self):
-        s = f"{self.__class__.__name__}"
+        s = f"{self.__class__.__name__}:{self.cls.__name__}({self.name})"
         for n in self.children:
             s += "\n    "
             s += "\n    ".join(str(n).split("\n"))
@@ -167,241 +286,273 @@ class RepeatBlock(Block):
         super().__init__()
         self.repeat_count: int = repeat_count
 
-    def emit(self, **kwargs):
-        s = ""
+    def stamp(self, template_translation: dict[str, str]):
         for _ in range(self.repeat_count):
-            s += self.emit_children(0, **kwargs)
-        return s
+            for copy_c in self.copy_children(self):
+                copy_c.stamp(template_translation)
+        self.cut()
 
 
-class TemplatableBlock(Block):
-    registry: dict[str, "TemplatableBlock"] = {}
-
-    def __init__(self, name: str, template_args: tuple[str]):
+class TemplateableBlock(Block):
+    def __init__(self, name: str):
         super().__init__()
-        self.name: str = name
-        if name in TemplatableBlock.registry:
-            raise CompileError(f"Duplicate block identifier '{name}'.")
-        TemplatableBlock.registry[name] = self
-        self.template_args: tuple[str] = template_args
-        self.instantiations: set[tuple[str]] = set()
-        if len(template_args) == 0:
-            self.instantiations.add(tuple())
+        self.name = name
 
-    def get_literal_args(self, **kwargs) -> tuple[str]:
-        for template_arg in self.template_args:
-            if template_arg not in kwargs:
-                raise CompileError()
-        return tuple(kwargs[template_arg] for template_arg in self.template_args)
+    def __str__(self):
+        s = f"{self.__class__.__name__}({self.name})"
+        for n in self.children:
+            s += "\n    "
+            s += "\n    ".join(str(n).split("\n"))
+        return s + "\n"
+    
+class Label(TemplateableBlock):
+    registry : dict[Label] = {}
 
-    def get_kwargs(self, instantiation: tuple[str]) -> dict[str, str]:
-        if len(instantiation) != len(self.template_args):
-            raise CompileError()
-        return {k: v for k, v in zip(self.template_args, instantiation)}
+    def stamp_root(self, template_translation: dict[str, str]):
+        self.stamp(template_translation)
+        self.recurse("stamp", template_translation)
+        self.recurse("register_labels")
+        self.recurse("register_targets")
 
-    def get_literal_target(self, instantiation: tuple[str], **kwargs) -> str:
-        if instantiation not in self.instantiations:
-            raise CompileError()
-        target = self.name
-        if (len(self.template_args) == 0):
-            for v in kwargs.values():
-                target += "__" + str(v)
-        for literal_arg in instantiation:
-            target += "__" + literal_arg
-        return target
-
-    def register_target(self, **kwargs):
-        if len(self.template_args) != 0:
-            return
+    def stamp(self, template_translation: dict[str, str]):
+        if len(template_translation) > 0:
+            self.mangled_name = self.name + "__" + "__".join(v for v in template_translation.values())
         else:
-            self.recurse(JumpInstruction.register_target, **kwargs)
+            self.mangled_name =  self.name
+        self.recurse("stamp", template_translation)
 
-    def add_instantiation(self, instantiation: tuple[str]):
-        if instantiation in self.instantiations:
-            return
-        self.instantiations.add(instantiation)
-        self.recurse(
-            JumpInstruction.register_target,
-            **self.get_kwargs(instantiation),
-        )
+    def register_labels(self):
+        Label.registry[self.name] = self
+        self.recurse("register_labels")
 
-
-class Label(TemplatableBlock):
-    def emit(self, **kwargs) -> str:
-        s = ""
-        for instantiation in self.instantiations:
-            s += (
-                f"label {self.get_literal_target(instantiation, **kwargs)}:"
-                + self.emit_children(1, **kwargs, **self.get_kwargs(instantiation))
-            )
-        return s
+    def register_targets(self):
+        Label.registry[self.name] = self
+        self.recurse("register_targets")
 
 
-class Procedure(TemplatableBlock):
-    def __init__(self, name: str, template_args: tuple[str]):
-        super().__init__(name, template_args)
-        self.counters = {k: 0 for k in self.instantiations}
-    def add_instantiation(self, instantiation: tuple[str]):
-        TemplatableBlock.add_instantiation(self, instantiation)
-        self.counters = {k: 0 for k in self.instantiations}
+    def emit(self) -> str:
+        return f"label {self.mangled_name}:" + self.emit_children(1)
 
-    def get_return_target(self, instantiation : tuple[str]) -> str:
-        return TemplatableBlock.get_literal_target(self, instantiation)+ f"__{self.counters[instantiation]}"
 
-    def inline(self, instantiation: tuple[str]) -> str:
-        if instantiation not in self.instantiations:
-            raise CompileError
-        target = (
-            self.get_return_target(instantiation) 
-        )
-        s = self.emit_children(
-            0, **self.get_kwargs(instantiation), counter=self.counters[instantiation]
-        )
-        s += f"label {target}:\n"
-        self.counters[instantiation] += 1
-        return s
+class Procedure(TemplateableBlock):
+    proc_counter : int = 0
+    registry : dict[Procedure] = {}
 
-    def emit(self, **kwargs) -> str:
+    def stamp_root(self, template_translation : dict[str,str]):
+        self.stamp(template_translation)
+
+    def stamp(self, template_translation : dict[str, str]):
+        self.template_translation = deepcopy(template_translation)
+        trailing_label = Label(self.name + "__return")
+        self.children.append(trailing_label)
+        trailing_label.parent = self
+
+    def register_labels(self):
+        Procedure.registry[self.name] = self
+
+    def register_targets(self):
+        pass
+
+    def inline(self, after: Node) -> list[Node]:
+        self.template_translation["__proc_counter"] = str(self.proc_counter)
+        inlined = Block() 
+        self.copy_children_on(inlined)
+        inlined.recurse("stamp", self.template_translation)
+        inlined.recurse("register_labels")
+        inlined.recurse("replace_return", inlined.children[-1])
+        inlined.recurse("register_targets")
+        self.proc_counter += 1
+        return inlined.transplant_children(after)
+
+    def emit(self) -> str:
         return ""
 
 
 class TemplateSpecialisationBlock(Block):
-    def __init__(self, template_args: tuple[str]):
+    def __init__(self, literal_args: tuple[str]):
         super().__init__()
-        self.literal_args: tuple[str] = template_args
+        self.literal_args: tuple[str] = literal_args
 
-    def check_literal_args(self, **kwargs) -> bool:
-        parent = self.parent
-        while parent is not None:
-            if isinstance(parent, TemplatableBlock):
-                if len(parent.template_args) == 0:
-                    parent = parent.parent
-                    continue
-                if len(parent.template_args) != len(self.literal_args):
-                    raise CompileError(
-                        "Template specialisation blocks must have the exact same number of arguments as their parent template blocks."
-                    )
-                for template_arg, literal_arg in zip(
-                    parent.template_args, self.literal_args
-                ):
-                    if literal_arg == "*":
-                        continue    
-                    if kwargs[template_arg] != literal_arg:
-                        return False
-                return True
-            parent = parent.parent
+    def stamp(self, template_translation: dict[str, str]):
+        template_translation = Template.remove_internals(template_translation)
+        if len(self.literal_args) != len(template_translation):
+            raise CompileError(f"Enclosing template has {len(template_translation)} template arguments, but template specialisation provided {len(self.literal_args)}.")
+        for literal_arg, template_translation_arg in zip(self.literal_args, template_translation.values()):
+            if literal_arg == "*":
+                continue
+            if literal_arg != template_translation_arg:
+                self.cut()
+                return
+        self.recurse("stamp", template_translation)
+        self.transplant_children(self)
+        self.cut()
 
-    def register_target(self, **kwargs):
-        if not self.check_literal_args(**kwargs):
-            return
-        self.recurse(JumpInstruction.register_target, **kwargs)
+    def register_labels(self):
+        pass
 
-    def emit(self, **kwargs) -> str:
-        if not self.check_literal_args(**kwargs):
-            return ""
-        return self.emit_children(0, **kwargs)
+    def register_targets(self):
+        pass
 
 
 class Instruction(Node):
-    def __init__(self, ins: str, args: str):
+    def __init__(self, ins: str):
         super().__init__()
         self.ins: str = ins
-        self.args: str = args
+        self.args: list[Argument] = []
 
-    def emit(self, **kwargs) -> str:
-        return f"{self.ins} {self.args}"
+    def stamp(self, template_translation: dict[str, str]):
+        for arg in self.args:
+            arg.stamp(template_translation)
+
+    def recurse(self, func: str, *args, **kwargs):
+        for arg in self.args:
+            try:
+                getattr(arg, func)(*args, **kwargs)
+            except AttributeError:
+                continue
+
+    def __str__(self):
+        return f"{self.__class__.__name__}({self.ins})"
+
+    def emit(self) -> str:
+        return self.ins + " " + " ".join(arg.emit() for arg in self.args)
 
 
 class JumpInstruction(Instruction):
-    def register_target(self, **kwargs):
-        match = re.match(r"([a-zA-Z0-9_]+)(?:<([a-zA-Z0-9_ ,]+)>)?", self.args)
-        self.target_name = match.group(1)
-        if self.target_name == "return":
-            return
-        if self.target_name not in TemplatableBlock.registry:
-            raise CompileError(
-                f"No block identifier found with name '{self.target_name}'."
-            )
-        self.target_template_args = tuple()
-        if match.group(2) is not None:
-            self.target_template_args = tuple(
-                e.strip() for e in match.group(2).split(",")
-            )
-            # if applicable: replace template args with literals
-            target_literal_args = tuple(
-                kwargs[arg] if arg in kwargs else arg
-                for arg in self.target_template_args
-            )
-            parent = self.parent
-            # check whether all arguments are really literals
-            while parent.parent is not None:
-                if isinstance(parent, TemplatableBlock):
-                    for arg in target_literal_args:
-                        if arg in parent.template_args:
-                            return
-                parent = parent.parent
-            # if so, add this instantiation to appropriate templatable block
-            target_block = TemplatableBlock.registry[self.target_name]
-            if len(target_block.template_args) != len(target_literal_args):
-                raise CompileError(
-                    f"Block '{target_block.name}' requires {len(target_block.template_args)} template arguments but {len(target_literal_args)} were given."
-                )
-            TemplatableBlock.registry[self.target_name].add_instantiation(
-                target_literal_args
-            )
+    def register_targets(self):
+        arg = self.args[0]
+        if isinstance(arg, LabelArgument):
+            arg.register_targets(Label)
 
-    def get_literal_args(self, **kwargs) -> tuple[str]:
-        return tuple(
-            kwargs[template_arg] if template_arg in kwargs else template_arg
-            for template_arg in self.target_template_args
-        )
-
-    def emit(self, **kwargs) -> str:
-        if self.target_name == "return":
-            block = None
-            parent = self.parent
-            while parent.parent is not None:
-                if isinstance(parent, Procedure):
-                    block = parent
-                    break
-                parent = parent.parent
-            if block is None:
-                raise CompileError(
-                    "Cannot use the 'return' label outside of a procedure block."
-                )
-            self.target_template_args = block.template_args
-            target = block.get_return_target(self.get_literal_args(**kwargs))
-        else:
-            block = TemplatableBlock.registry[self.target_name]
-            b = block
-            while b is not None:
-                if isinstance(b, TemplatableBlock):
-                    if len(b.template_args) != 0:
-                        target = block.get_literal_target(
-                        self.get_literal_args(**kwargs), **kwargs)
-                        break
-                b = b.parent
-            if b is None:
-                target = self.target_name
-
-        return f"{self.ins} {target}"
+    def emit(self) -> str:
+        arg = self.args[0]
+        if isinstance(arg, LabelArgument):
+            return self.ins + " " + arg.target.mangled_name
+        return self.ins + " " + arg.arg
 
 
 class CallInstruction(JumpInstruction):
-    def emit(self, **kwargs) -> str:
-        proc = TemplatableBlock.registry[self.target_name]
-        if not isinstance(proc, Procedure):
-            raise CompileError(
-                f"Cannot use 'call' on {self.target_name} because it is not a procedure."
-            )
-        s = ""
-        if self.ins == "calltrue":
-            s = f"jfalse {proc.get_return_target(self.get_literal_args(**kwargs))}\n"
-        elif self.ins == "callfalse":
-            s = f"jtrue {proc.get_return_target(self.get_literal_args(**kwargs))}\n"
+    def register_targets(self):
+        self.args[0].register_targets(Procedure)     
+        proc : Procedure = self.args[0].target
+        inlined = proc.inline(self)
+        if self.ins in ("calltrue", "callfalse"):
+            if self.ins == "calltrue":
+                j_ins = JumpInstruction("jfalse")
+            if self.ins == "callfalse":
+                j_ins = JumpInstruction("jtrue")
+            j_ins.insert_after(self)
+            j_ins_arg = LabelArgument(j_ins, "")
+            j_ins_arg.target = inlined[-1]
+            j_ins.args = [j_ins_arg]
+        self.cut()
 
-        s += proc.inline(self.get_literal_args(**kwargs))
-        return s
+    def emit():
+        raise CompileError()
+
+
+class Argument:
+    re_pattern: str = r"\$?(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+"
+
+    def __init__(self, ins: Instruction, arg: str):
+        self.ins = ins
+        self.arg = arg
+
+    def stamp(self, template_translation: dict[str, str]):
+        for k, v in template_translation.items():
+            self.arg = re.sub(f"\\[ *{k} *\\]", v, self.arg)
+
+    def emit(self) -> str:
+        return self.arg
+
+
+class ConstantArgument(Argument):
+    re_pattern: str = r"(?:0b|0x|)(?:[a-fA-F0-9]|(?:\[[a-zA-Z0-9_ ]+\]))+"
+
+
+class LabelArgument(Argument):
+    re_pattern: str = r"(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+(?:<[a-zA-Z0-9_ ,]+>)?"
+    target = None
+    def register_targets(self, target_cls : type[TemplateableBlock]):
+        if len(self.template_args) == 0:
+            if self.arg != "return":
+                self.target = target_cls.registry[self.arg]
+            if self.target is None:
+                raise CompileError(f"No viable block target found for label argument '{self.arg}'.")
+            return
+        if self.target_name not in Template.registry:
+            raise CompileError(f"No viable template found with name '{self.target_name}' for label argument '{self.arg}'.")
+        target_template = Template.registry[self.target_name]
+        if target_template.cls is not target_cls:
+            raise CompileError(f"Template {target_template.name} produces {target_template.cls}, but one that produces {target_cls} is required.")
+        if len(self.template_args) != len(target_template.template_args):
+            raise CompileError(f"Template {target_template.name} requires {len(target_template.template_args)} template arguments but {len(self.template_args)} were provided.")
+        if self.template_args not in target_template.instantiations:
+            target_template.add_instantiation(self.template_args)
+        self.target = target_template[self.template_args]
+
+
+    def stamp(self, template_translation: dict[str, str]):
+        Argument.stamp(self, template_translation)
+        match = re.search(r"<([a-zA-Z0-9_ ,]+)>", self.arg)
+        if match is None:
+            self.template_args = tuple()
+            return
+        template_args = tuple(e.strip() for e in  match.group(1).split(","))
+        template_translation = Template.remove_internals(template_translation)
+        self.template_args = tuple(template_translation[t] if t in template_translation else t for t in template_args)
+        self.target_name = self.arg[:match.start()]
+
+    def replace_return(self, trailing_label : Label):
+        if self.arg != "return":
+            return
+        self.target = trailing_label
+
+
+class RegisterArgument(Argument):
+    re_pattern: str = r"\$(?:[a-zA-Z0-9_]|(?:\[[a-zA-Z0-9_ ]+\]))+"
+
+
+instructions: dict[str, tuple[type[Instruction], tuple[type[Argument], ...]]] = {
+    "add": (Instruction, (Argument, Argument, RegisterArgument)),
+    "sub": (Instruction, (Argument, Argument, RegisterArgument)),
+    "mul": (Instruction, (Argument, Argument, RegisterArgument)),
+    "div": (Instruction, (Argument, Argument, RegisterArgument)),
+    "mod": (Instruction, (Argument, Argument, RegisterArgument)),
+    "rand": (Instruction, (Argument, Argument, RegisterArgument)),
+    "and": (Instruction, (Argument, Argument, RegisterArgument)),
+    "or": (Instruction, (Argument, Argument, RegisterArgument)),
+    "xor": (Instruction, (Argument, Argument, RegisterArgument)),
+    "not": (Instruction, (Argument, RegisterArgument)),
+    "lshift": (Instruction, (Argument, Argument, RegisterArgument)),
+    "rshift": (Instruction, (Argument, Argument, RegisterArgument)),
+    "mov": (Instruction, (Argument, RegisterArgument)),
+    "read": (Instruction, (Argument, RegisterArgument)),
+    "write": (Instruction, (Argument, Argument)),
+    "cmp": (Instruction, (Argument, Argument)),
+    "gte": (Instruction, (Argument, Argument)),
+    "lte": (Instruction, (Argument, Argument)),
+    "gt": (Instruction, (Argument, Argument)),
+    "lt": (Instruction, (Argument, Argument)),
+    "jmp": (JumpInstruction, (LabelArgument,)),
+    "jtrue": (JumpInstruction, (LabelArgument,)),
+    "jfalse": (JumpInstruction, (LabelArgument,)),
+    "jumpir": (JumpInstruction, (Argument,)),
+    "call": (CallInstruction, (LabelArgument,)),
+    "calltrue": (CallInstruction, (LabelArgument,)),
+    "callfalse": (CallInstruction, (LabelArgument,)),
+    "wait": (Instruction, ()),
+    "stop": (Instruction, ()),
+    "syscall": (Instruction, ()),
+    "log": (Instruction, (Argument,)),
+    "fwd": (Instruction, ()),
+    "turnl": (Instruction, (Argument,)),
+    "turnr": (Instruction, (Argument,)),
+    "fsens": (Instruction, ()),
+    "lsens": (Instruction, ()),
+    "rsens": (Instruction, ()),
+    "nsens": (Instruction, ()),
+}
 
 
 class CompileError(Exception):
@@ -409,11 +560,29 @@ class CompileError(Exception):
 
 
 def compile(source: BufferedReader) -> str:
-    root = Block()
-    root.parse(source)
+    print("Parsing...", end="")
+    begin_time = time.time_ns()
+    root = Parser(source).parse()
+    end_time = time.time_ns()
+    print(f" took {(end_time - begin_time) / 1000000} ms.")
+    begin_time = end_time
+
+    print(f"AST for '{source.name}':")
     print(root)
-    root.recurse(JumpInstruction.register_target)
-    return root.emit_children(0)
+    print("Compiling...", end="")
+    root.recurse("stamp", {})
+    root.recurse("register_labels")
+    root.recurse("register_targets")
+    end_time = time.time_ns()
+    print(f" took {(end_time - begin_time) / 1000000} ms.")
+    begin_time = end_time
+
+    print("Emitting...", end="")
+    emission =  root.emit_children(0)
+    end_time = time.time_ns()
+    print(f" took {(end_time - begin_time) / 1000000} ms.")
+    begin_time = end_time
+    return emission
 
 
 static_registers = (
@@ -434,7 +603,7 @@ static_registers = (
     "edge_nearby",
     "wall_nearby",
     "player_nearby",
-    "powerup_nearby"
+    "powerup_nearby",
 )
 register_chars = string.ascii_lowercase + string.digits + "_"
 
@@ -479,9 +648,7 @@ def minify(source: str) -> str:
 
     for k, v in labels.items():
         print(f"label {k} -> {v}")
-        source = re.sub(
-            f"(jmp|jtrue|jfalse) +{k}(\\s)", f"\\1 {v}\\2", source
-        )
+        source = re.sub(f"(jmp|jtrue|jfalse) +{k}(\\s)", f"\\1 {v}\\2", source)
         source = re.sub(f"label +{k} *:", f"label {v}:", source)
 
     # strip whitespace
