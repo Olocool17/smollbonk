@@ -1,0 +1,280 @@
+repeat 6800: jmp scan_covered
+repeat 400: jmp first_evasion
+repeat 2000: jmp scan_covered
+repeat 400: jmp second_evasion
+repeat 3:
+    repeat 2000:
+        jmp scan_open
+    repeat 400:
+        jmp later_evasion
+
+proc double_attack:
+    syscall
+
+label attack:
+    log attack
+    syscall
+    repeat 8:
+        mov 3 $syscall_register
+        syscall
+        cmp $br2 0b00100
+        jfalse attack_search
+        fwd
+        gte $br1 0b00100
+        calltrue double_attack
+
+template<DISTANCE> proc check_for_turn:
+    log check_for_turn
+    template<far>: 
+        and $forward 0b10100 $forward_player
+        gt $forward_player 0
+    template<near>: cmp $br2 0b00100 
+    jtrue turn_forward
+    template<far>: 
+        and $left 0b10100 $left_player
+        gt $left_player 0
+    template<near>: cmp $br5 0b00100
+    jtrue turn_left
+    template<far>: 
+        and $right 0b10100 $right_player
+        gt $right_player 0
+    template<near>: cmp $br8 0b00100 
+    jfalse return
+    label turn_right:
+        template<far>:
+            lt $br8 0b00100
+            jtrue return
+        log turn_right
+        mov 2 $syscall_register 
+        syscall
+        mov 0 $syscall_register
+        gte $br7 0b00100
+        jfalse attack
+        syscall
+        jmp attack
+    label turn_left:
+        template<far>:
+            lt $br5 0b00100 
+            jtrue return
+        log turn_left
+        mov 1 $syscall_register
+        syscall
+        mov 0 $syscall_register
+        gte $br4 0b00100
+        jfalse attack
+        syscall
+        jmp attack
+    label turn_forward:
+        template<far>:
+            lt $br2 0b00100
+            jtrue return
+        log turn_forward
+        mov 0 $syscall_register
+        gte $br1 0b00100
+        jfalse attack
+        syscall
+        jmp attack
+
+template<FLANKS> proc calculate_senses:
+    log calculate_senses
+    or $br4 $br5 $left
+    or $br7 $br8 $right
+    or $br1 $br2 $forward
+    template<flanks>: or $br3 $br6 $flanks
+
+label scan_covered:
+    log alert_covered
+    repeat 2:
+        call calculate_senses<no_flanks>
+        call check_for_turn<far>
+        mov 3 $syscall_register
+        syscall
+    jumpir $tick
+
+
+proc one_eighty:
+    turnr 3
+    mov 1 $syscall_arg_register
+
+label attack_search:
+    log attack_search
+    call check_for_turn<near>
+    jumpir $tick
+
+label scan_open:
+    log scan_open
+    repeat 5:
+        repeat 2:
+            call calculate_senses<flanks>
+            call check_for_turn<far>
+            and $flanks 0b00100 $flanks_player
+            cmp $flanks_player 0b00100
+            callfalse one_eighty
+            mov 3 $syscall_register
+            syscall
+        gte $tick $evasion_alarm
+        jtrue reset
+    jmp scan_open
+
+
+proc first_evasion_field_left_noright:
+    cmp $br2 0b00001
+    calltrue evasion_move<2, first>
+    call evasion_move<1, first>
+
+proc first_evasion_field_right:
+    cmp $br5 0b00001
+    calltrue evasion_move<3, first>
+    cmp $br2 0b00001
+    calltrue evasion_move<4, first>
+    call evasion_move<5, first>
+
+label first_evasion:
+    log first_evasion
+    lt $tick $evasion_alarm
+    jtrue scan_open
+    repeat 5:
+        mov 3 $syscall_register
+        syscall
+        cmp $br8 0b00001
+        calltrue first_evasion_field_right
+        cmp $br5 0b00001
+        calltrue first_evasion_field_left_noright
+        call evasion_move<0, first>
+
+proc second_evasion_field_left_noright:
+    cmp $br1 0b00001
+    calltrue evasion_move<2, second>
+    call evasion_move<1, second>
+
+proc second_evasion_field_right:
+    cmp $br4 0b00001
+    calltrue evasion_move<3, second>
+    cmp $br1 0b00001
+    calltrue evasion_move<4, second>
+    call evasion_move<5, second>
+
+label second_evasion:
+    log second_evasion
+    lt $tick $evasion_alarm
+    jtrue scan_open
+    repeat 5:
+        mov 3 $syscall_register
+        syscall
+        cmp $br7 0b00001
+        calltrue second_evasion_field_right
+        cmp $br4 0b00001
+        calltrue second_evasion_field_left_noright
+        call evasion_move<0, second>
+
+proc later_evasion_field_left_noright:
+    cmp $forward 0b00001
+    calltrue evasion_move<2, later>
+    call evasion_move<1, later>
+
+proc later_evasion_field_right:
+    cmp $left 0b00001
+    calltrue evasion_move<3, later>
+    cmp $forward 0b00001
+    calltrue evasion_move<4, later>
+    call evasion_move<5, later>
+
+label later_evasion:
+    log later_evasion
+    lt $tick $evasion_alarm
+    jtrue scan_open
+    repeat 5:
+        mov 3 $syscall_register
+        syscall
+        and $br4 $br5 $left
+        and $br7 $br8 $right
+        and $br1 $br2 $forward
+        cmp $right 0b00001
+        calltrue second_evasion_field_right
+        cmp $left 0b00001
+        calltrue second_evasion_field_left_noright
+        call evasion_move<0, later>
+
+template<TURN, EVASION_STAGE> proc evasion_move:
+    template<1 , *>: 
+        mov 2 $syscall_register
+        syscall
+        mov 3 $syscall_register
+        syscall
+    template<2 , *>: turnr 2
+        mov 3 $syscall_register
+        syscall
+        mov 1 $syscall_arg_register
+    template<3 , *>: turnr 3
+        mov 3 $syscall_register
+        syscall
+        mov 1 $syscall_arg_register
+    template<4 , *>: turnr 4
+        mov 3 $syscall_register
+        syscall
+        mov 1 $syscall_arg_register
+    template<5 , *>: turnr 5
+        mov 3 $syscall_register
+        syscall
+        mov 1 $syscall_arg_register
+    cmp $br2 0b00010
+    jtrue evasion_move_sidestep
+    fwd
+    add $evasion_alarm 2400 $evasion_alarm
+    jumpir $tick
+    label evasion_move_sidestep:
+        cmp $br8 0b00010
+        jtrue evasion_move_sidestep_alternate
+        mov 2 $syscall_register
+        syscall
+        fwd
+        template<*, first>: jmp first_evasion
+        template<*, second>: jmp second_evasion
+        template<*, later>: jmp later_evasion
+    label evasion_move_sidestep_alternate:
+        mov 1 $syscall_register
+        syscall
+        fwd
+        template<*, first>: jmp first_evasion
+        template<*, second>: jmp second_evasion
+        template<*, later>: jmp later_evasion
+
+label reset:
+    jumpir $tick
+
+template<TURN> proc cycle_segment:
+    fwd
+    syscall
+    syscall
+    syscall
+    syscall
+    syscall
+    label cycle_catchup:
+        mov 3 $syscall_register
+        syscall
+        cmp $br2 0b00001
+        jtrue cycle_finalise
+        fwd
+        cmp $br1 0b00001
+        jtrue cycle_catchup
+        syscall
+    label cycle_finalise:
+        mov 2 $syscall_register
+        template<2>: mov 2 $syscall_arg_register
+        syscall
+        template<2>: mov 1 $syscall_arg_register
+
+label main:
+    mov 6800 $evasion_alarm
+    jumpir addressof(scan_covered)
+    mov 1 $syscall_arg_register
+    mov 0 $syscall_sens_register
+    mov 1 $syscall_register
+    syscall
+    repeat 17:
+        call cycle_segment<empty>
+    call cycle_segment<2>
+    mov 3 $syscall_register
+    syscall
+    jumpir $tick
+

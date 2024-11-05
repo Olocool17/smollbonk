@@ -1,0 +1,188 @@
+repeat 2:
+    repeat 50:
+        jmp roaming<NO_TURN>
+    repeat 50:
+        jmp roaming<DO_TURN>
+repeat 6300:
+    jmp defense
+repeat 2:
+    repeat 50:
+        jmp roaming<NO_TURN>
+    repeat 50:
+        jmp roaming<DO_TURN>
+repeat 500:
+    jmp roaming_evasion<FIRST>
+repeat 2:
+    repeat 50:
+        jmp roaming<NO_TURN>
+    repeat 50:
+        jmp roaming<DO_TURN>
+repeat 1700:
+    jmp defense
+repeat 500:
+    jmp roaming_evasion<LATER>
+repeat 4:
+    repeat 1900:
+        jmp defense
+    repeat 500:
+        jmp roaming_evasion<LATER>
+
+
+template<TURN> label roaming:
+    log roaming
+    fsens
+    lt $br2 4
+    calltrue obstacle<NO_FSENS>
+    fwd
+    cmp $br2 0b100
+    calltrue attack
+    template<NO_TURN>:
+        lt $br1 4
+        calltrue obstacle<DO_FSENS>
+    template<DO_TURN>:
+        call obstacle<DO_FSENS>
+    fwd
+    jumpir $tick
+
+template<FSENS> proc obstacle:
+    log obstacle
+    template<DO_FSENS>: fsens
+    label obstacle_sensed:
+        lt $br5 4
+        jfalse obstacle_none
+    label obstacle_obstacle:
+        lt $br8 4
+        jtrue obstacle_obstacle_obstacle
+    label obstacle_obstacle_none:
+        rand 2 5 $syscall_arg_register
+        jmp obstacle_turn
+    label obstacle_none:
+        lt $br8 4
+        jtrue obstacle_none_obstacle
+    label obstacle_none_none:
+        rand 1 5 $syscall_arg_register
+        jmp obstacle_turn
+    label obstacle_none_obstacle:
+        rand 1 4 $syscall_arg_register
+        jmp obstacle_turn
+    label obstacle_obstacle_obstacle:
+        rand 2 4 $syscall_arg_register
+    label obstacle_turn:
+        mov 1 $syscall_register
+        syscall
+    mov 3 $syscall_register
+    syscall
+    lt $br2 4
+    jfalse return
+    lt $br5 4
+    jfalse obstacle_turn_left
+    lt $br8 4
+    jfalse obstacle_turn_right
+    jmp obstacle_obstacle_obstacle
+    label obstacle_turn_right:
+        turnr 1
+        jmp return
+    label obstacle_turn_left:
+        turnl 1
+        jmp return
+
+template<RANK> label roaming_evasion:
+    log roaming_evasion
+    nsens
+    template<FIRST>: cmp $edge_nearby 1
+    template<LATER>: cmp $wall_nearby 1
+    jfalse static_defense
+    mov 0 $syscall_sens_register 
+    syscall
+    or $br1 $br2 $forward
+    or $br3 $forward $forward
+    or $br6 $forward $forward
+    and $forward 0b11 $forward_obstacles
+    gt $forward_obstacles 0
+    calltrue obstacle<NO_FSENS>
+    fwd
+    repeat 8:
+        log extended_roaming_evasion
+        nsens
+        template<FIRST>: cmp $edge_nearby 1
+        template<LATER>: cmp $wall_nearby 1
+        jfalse static_defense
+        mov 0 $syscall_sens_register 
+        syscall
+        lt $br2 4
+        calltrue obstacle<NO_FSENS>
+        fwd
+        log extended_roaming_evasion_unconditional_rotate
+        nsens
+        template<FIRST>: cmp $edge_nearby 1
+        template<LATER>: cmp $wall_nearby 1
+        jfalse static_defense
+        call obstacle<NO_FSENS>
+        fwd
+
+template<SYSCALL_READY> proc forward_sense:
+    log forward_sense
+    template<READY>: syscall
+    template<SENS_READY>:
+        mov 3 $syscall_register 
+        syscall
+    template<NOT_READY>: fsens
+    or $br4 $br5 $left
+    or $br7 $br8 $right
+    or $br5 $br2 $nearby
+    or $br8 $nearby $nearby
+
+template<ATTACK> proc reactive_turn:
+    log reactive_turn
+    and $left 0b10100 $left_player_powerup
+    gt $left_player_powerup 0
+    jtrue turn_left
+    and $right 0b10100 $right_player_powerup
+    gt $right_player_powerup 0
+    jfalse turn_finish
+    label turn_right:
+        turnr 1
+        jmp turn_finish
+    label turn_left:
+        turnl 1
+    label turn_finish:
+        and $nearby 0b10100 $nearby_player_powerup
+        gt $nearby_player_powerup 0
+        jfalse return
+        fwd
+    template<NO_FOLLOW_UP>:
+        jmp static_defense
+    template<FOLLOW_UP>:
+        call attack
+        jumpir $tick
+
+label static_defense:
+    log static_defense
+    call forward_sense<NOT_READY>
+    call reactive_turn<NO_FOLLOW_UP>
+    turnr 3
+    jumpir $tick
+
+label defense:
+    log defense
+    call forward_sense<NOT_READY>
+    call reactive_turn<FOLLOW_UP>
+    turnr 3
+    jumpir $tick
+
+proc attack:
+    log attack
+    nsens
+    repeat 6:
+        cmp $player_nearby 1
+        jfalse reset
+        fwd
+        mov 3 $syscall_register 
+        syscall
+
+label reset:
+    jumpir $tick
+
+label main:
+    turnl 1
+    jmp roaming<DO_TURN>
